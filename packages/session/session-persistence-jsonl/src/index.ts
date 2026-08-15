@@ -31,6 +31,7 @@ import {
   compressZstdFrame, createZstdFrameDecoder, decompressZstdFrame, decompressZstdPrefix, scanZstdFrames,
 } from './zstd.ts'
 import { ensureDurableDirectoryWin32, publishNewFileWin32 } from './win32.ts'
+import { acquireSessionLogWriterLock } from './writer-lock.ts'
 
 export type { JsonlCompression } from './format.ts'
 
@@ -82,10 +83,39 @@ export interface Config {
   writeBatchMaxDelayMs?: number
 }
 
-/** Opaque coordinator token for replacing bytes recovered from a torn frame. */
-interface JsonlTornMarker {
+/** Torn-tail state before the reading revision is attached; becomes a {@link JsonlTornMarker}. */
+interface PreparedTornMarker {
   truncateTo: number
   recoveredEvents: SessionEvent[]
+}
+
+/** Opaque coordinator token for replacing bytes recovered from a torn frame. */
+interface JsonlTornMarker extends PreparedTornMarker {
+  /** Log revision observed when the torn tail was read; a repair is valid only while it still matches. */
+  revision: PersistenceRevision
+}
+
+/** Cached durable tail identity: while the revision matches, the next append seq is known. */
+interface JsonlWriterTail {
+  revision: PersistenceRevision
+  nextSeq: number
+}
+
+/** Error thrown when the durable log moved under a writer holding a stale in-memory cursor. */
+class JsonlTailDivergedError extends Error {
+  /**
+   * Construct the divergence error.
+   * @param id - the session whose log moved.
+   * @param expectedSeq - the seq the caller's first event must continue.
+   * @param foundSeq - the seq the durable log actually continues from.
+   */
+  constructor(id: SessionId, readonly expectedSeq: number, readonly foundSeq: number) {
+    super(
+      `session log "${id}" advanced under this writer: expected the durable tail at seq ${expectedSeq}, `
+      + `found seq ${foundSeq} — another process or backend instance appended concurrently; reload before writing`,
+    )
+    this.name = 'JsonlTailDivergedError'
+  }
 }
 
 interface FileRevisionIdentity {
@@ -144,6 +174,8 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
   private compression: JsonlCompression
   private coordinator: PersistenceCoordinator<JsonlTornMarker>
   private rootEncodingCheck: Promise<void> | undefined
+  /** Durable tail cache per session id: skips a full-log re-read per append while the revision matches. */
+  private writerTails = new Map<SessionId, JsonlWriterTail>()
 
   constructor(ctx: Context, public config: Config) {
     super(ctx)
@@ -313,7 +345,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     signal?: AbortSignal,
   ): Promise<StoredPrefix<JsonlTornMarker>> {
     const { buffer, revision } = await this.readStableFile(path, signal)
-    let prefix: Omit<StoredPrefix<JsonlTornMarker>, 'revision'>
+    let prefix: Omit<StoredPrefix<PreparedTornMarker>, 'revision'>
     try {
       if (this.compression === 'zstd') {
         prefix = await this.readZstdPrefix(buffer, signal)
@@ -341,14 +373,19 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     signal?.throwIfAborted()
     await this.assertStoredIdentity(path, prefix.meta, expectedId, signal)
     signal?.throwIfAborted()
-    return { ...prefix, revision }
+    const { tornMarker, ...stored } = prefix
+    return {
+      ...stored,
+      revision,
+      ...tornMarker === undefined ? {} : { tornMarker: { ...tornMarker, revision } },
+    }
   }
 
   /** Decode complete frames and retain complete JSONL records from a torn final frame. */
   private async readZstdPrefix(
     buffer: Buffer,
     signal?: AbortSignal,
-  ): Promise<Omit<StoredPrefix<JsonlTornMarker>, 'revision'>> {
+  ): Promise<Omit<StoredPrefix<PreparedTornMarker>, 'revision'>> {
     signal?.throwIfAborted()
     const { frames, tornStart } = scanZstdFrames(buffer)
     signal?.throwIfAborted()
@@ -418,29 +455,116 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     }
   }
 
-  /** Durably append a batch, lazily materializing the file when not yet present. */
+  /**
+   * Durably append a batch, lazily materializing the file when not yet present.
+   * A materialized log takes the cross-process writer lock and verifies the
+   * durable tail still continues at the batch's first seq: a second backend
+   * instance or process appending from a stale cursor fails here instead of
+   * writing a seq fork into the log.
+   */
   async appendBatch(meta: SessionHeader, events: readonly SessionEvent[], isMaterialized: boolean): Promise<void> {
     await this.ensureRootEncoding()
-    if (isMaterialized) {
+    const path = logPath(this.root, meta.cwd, meta.id, this.compression)
+    // The lock spans materialization too: refreshing the tail cache outside it
+    // could stat a revision another writer already advanced past this batch.
+    const lock = await acquireSessionLogWriterLock(path)
+    try {
+      if (!isMaterialized) {
+        await this.materialize(meta, events)
+        await this.refreshTailCache(path, meta.id, events.length)
+        return
+      }
+      const nextSeq = await this.durableNextSeq(path, meta)
+      if (events[0] !== undefined && events[0].seq !== nextSeq) {
+        throw new JsonlTailDivergedError(meta.id, events[0].seq, nextSeq)
+      }
       await this.appendLines(meta, events)
-    } else {
-      await this.materialize(meta, events)
+      await this.refreshTailCache(path, meta.id, nextSeq + events.length)
+    } finally {
+      await lock.release()
     }
   }
 
   /**
    * Make a crash repair durable: truncate a torn tail, restore complete events
    * decoded from it, then append synthetic closers. Two fsync'd steps — the seam
-   * does not require this to be atomic.
+   * does not require this to be atomic. Both run under the cross-process writer
+   * lock, and the repair is abandoned when the log moved since the torn tail
+   * was read: repairing a concurrently-advanced log would rewind real events.
    */
   async commitRepair(
     meta: SessionHeader,
     tornMarker: JsonlTornMarker | undefined,
     closers: readonly SessionEvent[],
   ): Promise<void> {
-    if (tornMarker !== undefined) await this.repair(meta, tornMarker.truncateTo)
-    const repairedEvents = [...(tornMarker?.recoveredEvents ?? []), ...closers]
-    if (repairedEvents.length > 0) await this.appendLines(meta, repairedEvents)
+    const path = logPath(this.root, meta.cwd, meta.id, this.compression)
+    const lock = await acquireSessionLogWriterLock(path)
+    try {
+      if (tornMarker === undefined) {
+        // Closers-only repair: the durable tail must still sit exactly at the
+        // first closer; a writer that appended the real outcome closed the turn.
+        if (closers.length > 0) {
+          const nextSeq = await this.durableNextSeq(path, meta)
+          const firstCloserSeq = closers[0]?.seq
+          if (firstCloserSeq === undefined || firstCloserSeq !== nextSeq) {
+            throw new JsonlTailDivergedError(meta.id, firstCloserSeq ?? -1, nextSeq)
+          }
+          await this.appendLines(meta, closers)
+          await this.refreshTailCache(path, meta.id, nextSeq + closers.length)
+        }
+        return
+      }
+      const current = await this.readRevisionOf(path)
+      if (current !== tornMarker.revision) {
+        const expected = tornMarker.recoveredEvents[0]?.seq ?? closers[0]?.seq ?? 0
+        const actual = await this.durableNextSeq(path, meta)
+        throw new JsonlTailDivergedError(meta.id, expected, actual)
+      }
+      await this.repair(meta, tornMarker.truncateTo)
+      const repairedEvents = [...tornMarker.recoveredEvents, ...closers]
+      if (repairedEvents.length > 0) await this.appendLines(meta, repairedEvents)
+      this.writerTails.delete(meta.id)
+    } finally {
+      await lock.release()
+    }
+  }
+
+  /**
+   * Resolve the seq the durable log continues from, using the tail cache while
+   * the artifact revision still matches. A cache miss decodes the committed
+   * prefix once and repopulates the cache.
+   */
+  private async durableNextSeq(path: string, meta: SessionHeader): Promise<number> {
+    const revision = await this.readRevisionOf(path)
+    if (revision === undefined) {
+      throw new Error(`session log "${meta.id}" disappeared before its append: ${path}`)
+    }
+    const cached = this.writerTails.get(meta.id)
+    if (cached !== undefined && cached.revision === revision) return cached.nextSeq
+    const stored = await this.readPrefix(path, meta.id)
+    const nextSeq = stored.events.length
+    this.writerTails.set(meta.id, { revision, nextSeq })
+    return nextSeq
+  }
+
+  /** Read one artifact's current stat-derived revision, or `undefined` when absent. */
+  private async readRevisionOf(path: string): Promise<PersistenceRevision | undefined> {
+    try {
+      return fileRevision(await stat(path, { bigint: true }))
+    } catch (error: unknown) {
+      if (isENOENT(error)) return undefined
+      throw error
+    }
+  }
+
+  /**
+   * Record the tail cache after a committed write. The stat happens after the
+   * append's fsync, so the observed revision already includes the new bytes.
+   */
+  private async refreshTailCache(path: string, id: SessionId, nextSeq: number): Promise<void> {
+    const revision = await this.readRevisionOf(path)
+    if (revision === undefined) return
+    this.writerTails.set(id, { revision, nextSeq })
   }
 
   /** List valid unique stored sessions' metadata (header line only — no full-log parse). */
