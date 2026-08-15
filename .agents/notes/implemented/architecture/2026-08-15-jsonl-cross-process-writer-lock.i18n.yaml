@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-08-15-jsonl-cross-process-writer-lock.md
+2026-08-15-jsonl-cross-process-writer-lock.md: df08b95a0af10e18c9fbe75f228f8e8c92fedca1
+2026-08-15-jsonl-cross-process-writer-lock.zh.md: 1c2214b2a431d931b366b29b947f3ca25e827d5a
